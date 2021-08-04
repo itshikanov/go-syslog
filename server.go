@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"gopkg.in/mcuadros/go-syslog.v2/format"
+	//"fmt"
+	"runtime"
 )
 
 var (
@@ -20,8 +22,10 @@ var (
 )
 
 const (
+	//datagramChannelBufferSize = 10
+	//datagramReadBufferSize    = 64 * 1024
 	datagramChannelBufferSize = 10
-	datagramReadBufferSize    = 64 * 1024
+	datagramReadBufferSize    = 10 * 1024 * 1024
 )
 
 // A function type which gets the TLS peer name from the connection. Can return
@@ -33,7 +37,6 @@ type Server struct {
 	connections             []net.PacketConn
 	wait                    sync.WaitGroup
 	doneTcp                 chan bool
-	datagramChannelSize     int
 	datagramChannel         chan DatagramMessage
 	format                  format.Format
 	handler                 Handler
@@ -49,10 +52,7 @@ func NewServer() *Server {
 		New: func() interface{} {
 			return make([]byte, 65536)
 		},
-	},
-
-		datagramChannelSize: datagramChannelBufferSize,
-	}
+	}}
 }
 
 //Sets the syslog format (RFC3164 or RFC5424 or RFC6587)
@@ -73,10 +73,6 @@ func (s *Server) SetTimeout(millseconds int64) {
 // Set the function that extracts a TLS peer name from the TLS connection
 func (s *Server) SetTlsPeerNameFunc(tlsPeerNameFunc TlsPeerNameFunc) {
 	s.tlsPeerNameFunc = tlsPeerNameFunc
-}
-
-func (s *Server) SetDatagramChannelSize(size int) {
-	s.datagramChannelSize = size
 }
 
 // Default TLS peer name function - returns the CN of the certificate
@@ -103,6 +99,17 @@ func (s *Server) ListenUDP(addr string) error {
 	connection.SetReadBuffer(datagramReadBufferSize)
 
 	s.connections = append(s.connections, connection)
+	//p := make([]byte, 2048)
+	//go func() {
+	//	for {
+	//		_, _, err := connection.ReadFromUDP(p)
+	//		fmt.Printf("%s\n", p)
+	//		if err != nil {
+	//			fmt.Printf("Some error  %v", err)
+	//			continue
+	//		}
+	//	}
+	//}()
 	return nil
 }
 
@@ -330,57 +337,68 @@ type DatagramMessage struct {
 
 func (s *Server) goReceiveDatagrams(packetconn net.PacketConn) {
 	s.wait.Add(1)
-	go func() {
-		defer s.wait.Done()
-		for {
-			buf := s.datagramPool.Get().([]byte)
-			n, addr, err := packetconn.ReadFrom(buf)
-			if err == nil {
-				// Ignore trailing control characters and NULs
-				for ; (n > 0) && (buf[n-1] < 32); n-- {
-				}
-				if n > 0 {
-					var address string
-					if addr != nil {
-						address = addr.String()
+	for i := 0; i < runtime.NumCPU(); i++ {
+		go func() {
+			defer s.wait.Done()
+			for {
+				buf := s.datagramPool.Get().([]byte)
+				n, addr, err := packetconn.ReadFrom(buf)
+				//fmt.Printf("%s\n", buf[:n])
+				//fmt.Printf("%s\n", buf[:n])
+
+				if err == nil {
+					// Ignore trailing control characters and NULs
+					for ; (n > 0) && (buf[n-1] < 32); n-- {
 					}
-					s.datagramChannel <- DatagramMessage{buf[:n], address}
+					if n > 0 {
+						var address string
+						if addr != nil {
+							address = addr.String()
+						}
+						s.datagramChannel <- DatagramMessage{buf[:n], address}
+					}
+				} else {
+					// there has been an error. Either the server has been killed
+					// or may be getting a transitory error due to (e.g.) the
+					// interface being shutdown in which case sleep() to avoid busy wait.
+					opError, ok := err.(*net.OpError)
+					if (ok) && !opError.Temporary() && !opError.Timeout() {
+						return
+					}
+					//fmt.Println("asdf")
+					time.Sleep(10 * time.Millisecond)
 				}
-			} else {
-				// there has been an error. Either the server has been killed
-				// or may be getting a transitory error due to (e.g.) the
-				// interface being shutdown in which case sleep() to avoid busy wait.
-				opError, ok := err.(*net.OpError)
-				if (ok) && !opError.Temporary() && !opError.Timeout() {
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
 			}
-		}
-	}()
+		}()
+	}
 }
 
 func (s *Server) goParseDatagrams() {
-	s.datagramChannel = make(chan DatagramMessage, s.datagramChannelSize)
+	s.datagramChannel = make(chan DatagramMessage, datagramChannelBufferSize)
 
 	s.wait.Add(1)
-	go func() {
-		defer s.wait.Done()
-		for {
-			select {
-			case msg, ok := (<-s.datagramChannel):
-				if !ok {
-					return
-				}
-				if sf := s.format.GetSplitFunc(); sf != nil {
-					if _, token, err := sf(msg.message, true); err == nil {
-						s.parser(token, msg.client, "")
+	for i := 0; i < runtime.NumCPU(); i++ {
+		go func() {
+			defer s.wait.Done()
+			for {
+				select {
+				case msg, ok := (<-s.datagramChannel):
+					if !ok {
+						return
 					}
-				} else {
-					s.parser(msg.message, msg.client, "")
+					if sf := s.format.GetSplitFunc(); sf != nil {
+						//fmt.Printf("%s\n", msg.message[:cap(msg.message)])
+						if _, token, err := sf(msg.message, true); err == nil {
+							s.parser(token, msg.client, "")
+						}
+					} else {
+						s.parser(msg.message, msg.client, "")
+					}
+					//fmt.Printf("%s\n", msg.message[:cap(msg.message)])
+					s.datagramPool.Put(msg.message[:cap(msg.message)])
+
 				}
-				s.datagramPool.Put(msg.message[:cap(msg.message)])
 			}
-		}
-	}()
+		}()
+	}
 }
