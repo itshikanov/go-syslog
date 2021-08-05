@@ -1,7 +1,7 @@
 package syslog
 
 import (
-	"github.com/itshikanov/format"
+	"github.com/itshikanov/go-syslog/format"
 )
 
 //The handler receive every syslog entry at Handle method
