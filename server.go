@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"gopkg.in/mcuadros/go-syslog.v2/format"
+	"github.com/itshikanov/go-syslog/format"
 	//"fmt"
 	"runtime"
 )
